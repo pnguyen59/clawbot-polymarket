@@ -7,5 +7,5 @@
   "asset": "BTC",
   "window": "5m",
   "signal_source": "binance",
-  "volume_confidence": true
+  "volume_confidence": false
 }

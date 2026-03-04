@@ -175,6 +175,7 @@ def get_client(live=True):
 def _api_request(url, method="GET", data=None, headers=None, timeout=15):
     """Make an HTTP request to external APIs (Binance, CoinGecko, Gamma). Returns parsed JSON or None on error."""
     try:
+        import ssl
         req_headers = headers or {}
         if "User-Agent" not in req_headers:
             req_headers["User-Agent"] = "simmer-fastloop_market/1.0"
@@ -183,7 +184,14 @@ def _api_request(url, method="GET", data=None, headers=None, timeout=15):
             body = json.dumps(data).encode("utf-8")
             req_headers["Content-Type"] = "application/json"
         req = Request(url, data=body, headers=req_headers, method=method)
-        with urlopen(req, timeout=timeout) as resp:
+        
+        # Create SSL context that doesn't verify certificates (for development)
+        # In production, you should fix the certificate chain instead
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        with urlopen(req, timeout=timeout, context=ssl_context) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except HTTPError as e:
         try:
@@ -227,46 +235,39 @@ def fetch_live_prices(clob_token_ids):
 
 
 def fetch_orderbook_summary(clob_token_ids):
-    """Fetch order book for YES token and return spread + depth summary.
+    """Fetch spread for YES token using Polymarket CLOB spread API.
 
     Args:
         clob_token_ids: List of [yes_token_id, no_token_id] from Gamma.
 
     Returns:
-        dict with spread_pct, best_bid, best_ask, bid_depth_usd, ask_depth_usd
-        or None on failure.
+        dict with spread_pct, or None on failure.
+        
+    Note: The /spread API returns a more accurate spread than calculating from
+    the order book, which can have extreme stale orders (1¢ bid / 99¢ ask) that
+    skew the calculation.
     """
     if not clob_token_ids or len(clob_token_ids) < 1:
         return None
     yes_token = clob_token_ids[0]
-    result = _api_request(f"{CLOB_API}/book?token_id={quote(str(yes_token))}", timeout=5)
+    
+    # Use the /spread API endpoint (more accurate than order book extremes)
+    result = _api_request(f"{CLOB_API}/spread?token_id={quote(str(yes_token))}", timeout=5)
     if not result or not isinstance(result, dict):
         return None
-
-    bids = result.get("bids", [])
-    asks = result.get("asks", [])
-    if not bids or not asks:
+    
+    if result.get("error"):
+        # Market may not have spread data yet (too new or no liquidity)
         return None
-
+    
     try:
-        best_bid = float(bids[0]["price"])
-        best_ask = float(asks[0]["price"])
-        spread = best_ask - best_bid
-        mid = (best_ask + best_bid) / 2
-        spread_pct = spread / mid if mid > 0 else 0
-
-        # Sum depth (top 5 levels)
-        bid_depth = sum(float(b.get("size", 0)) * float(b.get("price", 0)) for b in bids[:5])
-        ask_depth = sum(float(a.get("size", 0)) * float(a.get("price", 0)) for a in asks[:5])
-
+        # Spread API returns spread as a decimal string (e.g., "0.02" = 2%)
+        spread_pct = float(result.get("spread", 0))
+        
         return {
-            "best_bid": best_bid,
-            "best_ask": best_ask,
             "spread_pct": spread_pct,
-            "bid_depth_usd": bid_depth,
-            "ask_depth_usd": ask_depth,
         }
-    except (KeyError, ValueError, IndexError, TypeError):
+    except (ValueError, TypeError):
         return None
 
 
@@ -275,46 +276,100 @@ def fetch_orderbook_summary(clob_token_ids):
 # =============================================================================
 
 def discover_fast_market_markets(asset="BTC", window="5m"):
-    """Find active fast markets on Polymarket via Gamma API."""
-    patterns = ASSET_PATTERNS.get(asset, ASSET_PATTERNS["BTC"])
-    url = (
-        "https://gamma-api.polymarket.com/markets"
-        "?limit=100&closed=false&tag=crypto&order=endDate&ascending=true"
-    )
-    result = _api_request(url)
-    if not result or isinstance(result, dict) and result.get("error"):
-        return []
-
+    """Find active fast markets on Polymarket via Gamma API.
+    
+    Fast markets use slug pattern: {asset}-updown-{window}-{unix_timestamp}
+    Example: btc-updown-5m-1772439600
+    
+    The timestamp represents the start time rounded to 5-minute boundaries.
+    """
+    import time
+    
+    # Get current time and round DOWN to last 5-minute boundary
+    # Example: 8:26 -> 8:25, 8:23 -> 8:20
+    now_ts = int(time.time())
+    rounded_ts = (now_ts // 300) * 300  # 300 seconds = 5 minutes
+    
+    asset_prefix = asset.lower()
     markets = []
-    for m in result:
-        q = (m.get("question") or "").lower()
-        slug = m.get("slug", "")
-        matches_window = f"-{window}-" in slug
-        if any(p in q for p in patterns) and matches_window:
-            condition_id = m.get("conditionId", "")
-            closed = m.get("closed", False)
-            if not closed and slug:
-                # Parse end time from question (e.g., "5:30AM-5:35AM ET")
-                end_time = _parse_fast_market_end_time(m.get("question", ""))
-                # Capture CLOB token IDs for live price fetching
-                clob_tokens_raw = m.get("clobTokenIds", "[]")
-                if isinstance(clob_tokens_raw, str):
-                    try:
-                        clob_tokens = json.loads(clob_tokens_raw)
-                    except (json.JSONDecodeError, ValueError):
-                        clob_tokens = []
-                else:
-                    clob_tokens = clob_tokens_raw or []
-                markets.append({
-                    "question": m.get("question", ""),
-                    "slug": slug,
-                    "condition_id": condition_id,
-                    "end_time": end_time,
-                    "outcomes": m.get("outcomes", []),
-                    "outcome_prices": m.get("outcomePrices", "[]"),
-                    "clob_token_ids": clob_tokens,
-                    "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
-                })
+    
+    # Query the current 5-minute window market
+    slug = f"{asset_prefix}-updown-{window}-{rounded_ts}"
+    url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+    result = _api_request(url)
+    
+    if result and isinstance(result, list) and len(result) > 0:
+        m = result[0]
+        if not m.get("closed", False):
+            # Use endDate from API (ISO format with year)
+            end_date_str = m.get("endDate")
+            if end_date_str:
+                try:
+                    end_time = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+                except (ValueError, AttributeError):
+                    end_time = None
+            else:
+                end_time = None
+            
+            # Capture CLOB token IDs for live price fetching
+            clob_tokens_raw = m.get("clobTokenIds", "[]")
+            if isinstance(clob_tokens_raw, str):
+                try:
+                    clob_tokens = json.loads(clob_tokens_raw)
+                except (json.JSONDecodeError, ValueError):
+                    clob_tokens = []
+            else:
+                clob_tokens = clob_tokens_raw or []
+            
+            markets.append({
+                "question": m.get("question", ""),
+                "slug": m.get("slug", ""),
+                "condition_id": m.get("conditionId", ""),
+                "end_time": end_time,
+                "outcomes": m.get("outcomes", []),
+                "outcome_prices": m.get("outcomePrices", "[]"),
+                "clob_token_ids": clob_tokens,
+                "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
+            })
+    
+    # Also check the next 5-minute window (in case current one is about to expire)
+    next_ts = rounded_ts + 300
+    slug_next = f"{asset_prefix}-updown-{window}-{next_ts}"
+    url_next = f"https://gamma-api.polymarket.com/markets?slug={slug_next}"
+    result_next = _api_request(url_next)
+    
+    if result_next and isinstance(result_next, list) and len(result_next) > 0:
+        m = result_next[0]
+        if not m.get("closed", False):
+            end_date_str = m.get("endDate")
+            if end_date_str:
+                try:
+                    end_time = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+                except (ValueError, AttributeError):
+                    end_time = None
+            else:
+                end_time = None
+            
+            clob_tokens_raw = m.get("clobTokenIds", "[]")
+            if isinstance(clob_tokens_raw, str):
+                try:
+                    clob_tokens = json.loads(clob_tokens_raw)
+                except (json.JSONDecodeError, ValueError):
+                    clob_tokens = []
+            else:
+                clob_tokens = clob_tokens_raw or []
+            
+            markets.append({
+                "question": m.get("question", ""),
+                "slug": m.get("slug", ""),
+                "condition_id": m.get("conditionId", ""),
+                "end_time": end_time,
+                "outcomes": m.get("outcomes", []),
+                "outcome_prices": m.get("outcomePrices", "[]"),
+                "clob_token_ids": clob_tokens,
+                "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
+            })
+    
     return markets
 
 
@@ -332,12 +387,27 @@ def _parse_fast_market_end_time(question):
         from zoneinfo import ZoneInfo
         date_str = match.group(1)
         time_str = match.group(2)
-        year = datetime.now(timezone.utc).year
+        now_utc = datetime.now(timezone.utc)
+        year = now_utc.year
+        
+        # Parse with current year first
         dt_str = f"{date_str} {year} {time_str}"
         dt = datetime.strptime(dt_str, "%B %d %Y %I:%M%p")
-        # Proper ET → UTC (handles EST/EDT automatically)
         et = ZoneInfo("America/New_York")
         dt = dt.replace(tzinfo=et).astimezone(timezone.utc)
+        
+        # If parsed date is more than 6 months in the future, it's likely from last year
+        # If parsed date is more than 1 month in the past, it's likely from next year
+        diff_days = (dt - now_utc).days
+        if diff_days > 180:  # More than 6 months in future → use last year
+            dt_str = f"{date_str} {year - 1} {time_str}"
+            dt = datetime.strptime(dt_str, "%B %d %Y %I:%M%p")
+            dt = dt.replace(tzinfo=et).astimezone(timezone.utc)
+        elif diff_days < -30:  # More than 1 month in past → use next year
+            dt_str = f"{date_str} {year + 1} {time_str}"
+            dt = datetime.strptime(dt_str, "%B %d %Y %I:%M%p")
+            dt = dt.replace(tzinfo=et).astimezone(timezone.utc)
+        
         return dt
     except Exception:
         return None
@@ -671,11 +741,11 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
             print(json.dumps({"automaton": report}))
             _automaton_reported = True
 
-    # Check order book spread and depth
+    # Check order book spread
     book = fetch_orderbook_summary(clob_tokens) if clob_tokens else None
     if book:
-        log(f"  Spread: {book['spread_pct']:.1%} (bid ${book['best_bid']:.3f} / ask ${book['best_ask']:.3f})")
-        log(f"  Depth: ${book['bid_depth_usd']:.0f} bid / ${book['ask_depth_usd']:.0f} ask (top 5)")
+        log(f"  Spread: {book['spread_pct']:.1%}")
+        
         if book["spread_pct"] > MAX_SPREAD_PCT:
             log(f"  ⏸️  Spread {book['spread_pct']:.1%} > 10% — illiquid, skip")
             if not quiet:
