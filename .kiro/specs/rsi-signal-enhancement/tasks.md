@@ -130,6 +130,14 @@ Implementation tasks for building a mock trading bot with RSI signals, WebSocket
   - [ ] 16.4 Add example output screenshots
   - [ ] 16.5 Document how to switch from mock to real trading
 
+- [ ] 17. Continuous Monitoring Enhancement
+  - [x] 17.1 Modify run_trading_iteration() to return monitoring status
+  - [x] 17.2 Update main loop to continue monitoring when entry conditions fail
+  - [x] 17.3 Add position monitoring during wait period
+  - [x] 17.4 Ensure WebSocket connections stay alive during wait
+  - [x] 17.5 Add clear status messages for "no trade, monitoring" state
+  - [ ] 17.6 Test continuous monitoring with open positions
+
 ## Notes
 
 - Start with tasks 1-2 (setup and RSI calculation) as they're foundational

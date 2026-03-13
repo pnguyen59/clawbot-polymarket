@@ -192,6 +192,34 @@ polymarket-direct-trading
 - 15.8 Handle keyboard interrupt (Ctrl+C) gracefully - close WebSockets, save mock history
 - 15.9 Restart WebSocket connections if they disconnect
 - 15.10 Continue trading even if one market fails (don't crash entire bot)
+
+### 16. Continuous Monitoring (Don't Skip Iteration)
+**As a trader**, I want the bot to continuously check entry conditions during the wait period, so that I can enter trades as soon as conditions are met.
+
+**Acceptance Criteria:**
+- 16.1 Check entry conditions continuously (every 5 seconds) during the wait period
+- 16.2 If entry conditions are met at any point, execute trade immediately
+- 16.3 After a trade is executed, stop checking entry conditions for that iteration (avoid double entry)
+- 16.4 Continue monitoring existing positions even after trade execution
+- 16.5 Log position status during the wait period (every 30 seconds)
+- 16.6 Check for exit conditions on existing positions continuously
+- 16.7 Display clear status: "Checking entry conditions (Xs elapsed)..."
+- 16.8 Keep WebSocket connections alive during wait period
+- 16.9 Process price updates from Polymarket WebSocket during wait
+- 16.10 The main loop should NEVER stop checking - always be ready to trade when conditions are met
+
+### 17. Expired Position Handling
+**As a trader**, I want positions that didn't exit before market resolution to be automatically closed as losses, so that my position tracking stays accurate.
+
+**Acceptance Criteria:**
+- 17.1 At the start of each iteration, check for expired positions from previous markets
+- 17.2 A position is expired if its market's 5-minute window has passed
+- 17.3 Expired positions are closed as losses (assume worst case: lost entire position cost)
+- 17.4 Update mock balance and stats to reflect the loss
+- 17.5 Remove expired positions from tracking
+- 17.6 Log each expired position with loss amount
+- 17.7 Show updated stats after closing expired positions
+- 17.8 Position expiry is determined by market_slug timestamp + 5 minutes
 **As a trader**, I want to automatically sell my position when it becomes profitable, so that I can lock in gains without waiting for market resolution.
 
 **Acceptance Criteria:**

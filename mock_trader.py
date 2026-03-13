@@ -1779,8 +1779,12 @@ class PolymarketPositionMonitor:
             message: JSON message from Polymarket WebSocket
         """
         try:
+            # Handle empty messages
+            if not message or message.strip() == "":
+                return
+            
             # Handle PONG response to PING heartbeat
-            if message == "PONG":
+            if message == "PONG" or message.strip() == "PONG":
                 return
             
             # Parse JSON message
@@ -1826,7 +1830,9 @@ class PolymarketPositionMonitor:
                 self._handle_market_resolution(market_id, winning_outcome)
         
         except json.JSONDecodeError as e:
-            log_websocket(f"Polymarket error parsing message: {e}")
+            # Only log if it's not an empty message issue
+            if message and message.strip():
+                log_websocket(f"Polymarket error parsing message: {e}")
         except (KeyError, ValueError, TypeError) as e:
             log_websocket(f"Polymarket error processing message: {e}")
         except Exception as e:
@@ -1836,14 +1842,18 @@ class PolymarketPositionMonitor:
         """
         Process price update and check exit conditions.
         
-        Calculates current P&L for the position and checks if the target
-        profit has been reached. If so, triggers the exit callback.
+        For mock trading, we use the market price directly (not bid/ask).
+        The price from the API represents the current market price.
+        
+        P&L = (current_price - entry_price) × shares
         
         Args:
             asset_id: Token ID (asset_id)
-            best_bid: Best bid price (price to sell at)
-            best_ask: Best ask price (price to buy at)
+            best_bid: Best bid price (used as current price indicator)
+            best_ask: Best ask price (alternative price indicator)
         """
+        global _mock_positions
+        
         # Check if we're monitoring this asset
         if asset_id not in self.positions:
             return
@@ -1854,13 +1864,9 @@ class PolymarketPositionMonitor:
         if position.get('exit_triggered', False):
             return
         
-        # Determine current price based on position side
-        if position['side'] == 'BUY':
-            # For BUY positions, we sell at best_bid
-            current_price = best_bid
-        else:
-            # For SELL positions, we buy back at best_ask
-            current_price = best_ask
+        # Use best_bid as current price (or best_ask if bid not available)
+        # In mock trading, we assume we can trade at this price
+        current_price = best_bid if best_bid is not None else best_ask
         
         if current_price is None:
             return
@@ -1868,18 +1874,12 @@ class PolymarketPositionMonitor:
         # Calculate current P&L
         entry_price = position['entry_price']
         shares = position['shares']
-        side = position['side']
         
-        # Gross profit (before fees)
-        # For BUY: profit when price goes up (sell at higher price)
-        # For SELL: profit when price goes down (buy back at lower price)
-        if side == 'BUY':
-            gross_profit = (current_price - entry_price) * shares
-        else:  # SELL
-            gross_profit = (entry_price - current_price) * shares
+        # Simple P&L: (current_price - entry_price) × shares
+        gross_profit = (current_price - entry_price) * shares
         
-        # Fee is 10% of gross profit
-        fee = abs(gross_profit) * 0.10
+        # Fee is 10% of gross profit (only on profits)
+        fee = gross_profit * 0.10 if gross_profit > 0 else 0
         
         # Net profit (after fees)
         net_profit = gross_profit - fee
@@ -1889,6 +1889,13 @@ class PolymarketPositionMonitor:
         position['gross_profit'] = gross_profit
         position['fee'] = fee
         position['net_profit'] = net_profit
+        
+        # Also update global _mock_positions for mock trading
+        if asset_id in _mock_positions:
+            _mock_positions[asset_id]['current_price'] = current_price
+            _mock_positions[asset_id]['gross_profit'] = gross_profit
+            _mock_positions[asset_id]['fee'] = fee
+            _mock_positions[asset_id]['net_profit'] = net_profit
         
         # Check exit condition
         target_profit = position.get('target_profit', 15.0)
@@ -2413,6 +2420,139 @@ def generate_market_slug(timestamp=None):
     return slug, rounded_ts
 
 
+def fetch_current_price_for_asset(asset_id, market_slug=None, outcome=None):
+    """
+    Fetch current price for an asset from Polymarket API.
+    
+    This function is used in mock trading mode to get real-time prices
+    for calculating P&L on simulated positions.
+    
+    Args:
+        asset_id: Token ID (asset_id) to get price for
+        market_slug: Optional market slug to fetch market data
+        outcome: Optional outcome ('Yes' or 'No') to match token by outcome
+    
+    Returns:
+        float or None: Current price for the asset, or None if not found
+    """
+    try:
+        # If we have a market slug, fetch market data
+        if market_slug:
+            market_info = fetch_market_by_slug(market_slug)
+            if market_info and market_info.get('tokens'):
+                # First try to match by outcome (more reliable)
+                if outcome:
+                    for token in market_info['tokens']:
+                        if token.get('outcome', '').lower() == outcome.lower():
+                            price = token.get('price')
+                            if price is not None:
+                                return price
+                
+                # Then try to match by asset_id
+                for token in market_info['tokens']:
+                    if token.get('asset_id') == asset_id:
+                        price = token.get('price')
+                        if price is not None:
+                            return price
+                
+                # If we have tokens but no match, use first token for BUY (Yes)
+                if len(market_info['tokens']) >= 1:
+                    price = market_info['tokens'][0].get('price')
+                    if price is not None:
+                        return price
+        
+        # Try to get price from CLOB API using token_id
+        url = f"https://clob.polymarket.com/price?token_id={asset_id}&side=sell"
+        response = requests.get(url, timeout=10, verify=False)
+        
+        if response.status_code == 200:
+            data = response.json()
+            price = data.get('price')
+            if price is not None:
+                return float(price)
+        
+        return None
+        
+    except Exception as e:
+        log_error(f"Error fetching price for asset {asset_id[:16]}...: {e}")
+        return None
+
+
+def update_mock_position_prices():
+    """
+    Update prices for all mock positions by fetching from API.
+    
+    This function fetches the current market price from the Gamma API
+    and calculates P&L for each position.
+    
+    Mock Trading Logic:
+    - Entry: Buy at current token price
+    - Exit: Sell at current token price  
+    - P&L = (current_price - entry_price) × shares
+    
+    Also checks if any position has reached target profit and triggers exit.
+    """
+    global _mock_positions
+    
+    if not _mock_positions:
+        return
+    
+    positions_to_exit = []
+    
+    for asset_id, position in list(_mock_positions.items()):
+        # Skip if already exiting
+        if position.get('exit_triggered'):
+            continue
+        
+        # Get market slug from position
+        market_slug = position.get('market_slug')
+        
+        # Determine which token we're holding (BUY = Yes token, SELL = No token)
+        side = position.get('side', 'BUY')
+        outcome = 'Yes' if side == 'BUY' else 'No'
+        
+        # Fetch current price from API
+        current_price = fetch_current_price_for_asset(asset_id, market_slug, outcome)
+        
+        if current_price is not None:
+            entry_price = position.get('entry_price', 0)
+            shares = position.get('shares', 0)
+            
+            # Simple P&L: (current_price - entry_price) × shares
+            gross_profit = (current_price - entry_price) * shares
+            fee = gross_profit * 0.10 if gross_profit > 0 else 0
+            net_profit = gross_profit - fee
+            
+            # Update position
+            position['current_price'] = current_price
+            position['gross_profit'] = gross_profit
+            position['fee'] = fee
+            position['net_profit'] = net_profit
+            
+            # Also update in Polymarket monitor if it exists
+            monitor = get_polymarket_monitor()
+            if monitor:
+                monitor_position = monitor.get_position_status(asset_id)
+                if monitor_position:
+                    monitor_position['current_price'] = current_price
+                    monitor_position['gross_profit'] = gross_profit
+                    monitor_position['fee'] = fee
+                    monitor_position['net_profit'] = net_profit
+            
+            # Check if target profit reached
+            target_profit = CONFIG.get('target_profit_per_trade', 15.0)
+            if net_profit >= target_profit:
+                log_exit(f"🎯 Target profit reached for {asset_id[:16]}...")
+                log_exit(f"   Entry: ${entry_price:.3f} -> Current: ${current_price:.3f}")
+                log_exit(f"   Net profit: ${net_profit:.2f} >= target ${target_profit:.2f}")
+                position['exit_triggered'] = True
+                positions_to_exit.append((asset_id, position, current_price))
+    
+    # Execute exits for positions that reached target
+    for asset_id, position, exit_price in positions_to_exit:
+        execute_mock_exit(position, exit_price)
+
+
 def fetch_market_by_slug(slug):
     """
     Fetch market details from Polymarket Gamma API by slug.
@@ -2842,7 +2982,7 @@ def get_mock_balance():
     return _mock_balance
 
 
-def execute_mock_trade(market_id, asset_id, side, position_size, entry_price):
+def execute_mock_trade(market_id, asset_id, side, position_size, entry_price, market_slug=None):
     """
     Execute a mock trade (no real API call).
     
@@ -2859,6 +2999,7 @@ def execute_mock_trade(market_id, asset_id, side, position_size, entry_price):
         side: 'BUY' or 'SELL'
         position_size: Dollar amount to trade
         entry_price: Price per share
+        market_slug: Market slug for fetching price updates
     
     Returns:
         dict: Result with success status, asset_id, shares, price, position_id
@@ -2919,14 +3060,16 @@ def execute_mock_trade(market_id, asset_id, side, position_size, entry_price):
         'side': side,
         'shares': shares,
         'entry_price': entry_price,
+        'current_price': entry_price,  # Initialize with entry price
         'cost': cost,
         'entry_time': time.time(),
         'status': 'open',
         'exit_price': None,
         'exit_time': None,
-        'gross_profit': None,
-        'fee': None,
-        'net_profit': None
+        'gross_profit': 0,
+        'fee': 0,
+        'net_profit': 0,
+        'market_slug': market_slug  # Store for price updates
     }
     
     # Add to open positions
@@ -2965,36 +3108,17 @@ def execute_mock_exit(position, exit_price):
     5. Updating mock stats (wins/losses, total P&L)
     6. Removing from open positions
     
+    P&L Calculation:
+    - gross_profit = (exit_price - entry_price) × shares
+    - fee = 10% of gross_profit (only if profit > 0)
+    - net_profit = gross_profit - fee
+    
     Args:
         position: Position dict from monitor (contains entry details)
         exit_price: Exit price per share
     
     Returns:
         dict: Result with success status and net profit
-        
-        Success example:
-        {
-            'success': True,
-            'net_profit': 15.00
-        }
-        
-        Failure example:
-        {
-            'success': False,
-            'error': 'Position not found in mock positions'
-        }
-    
-    Examples:
-        >>> # Execute mock exit
-        >>> position = {
-        ...     'asset_id': '71321...',
-        ...     'side': 'BUY',
-        ...     'shares': 333.33,
-        ...     'entry_price': 0.40
-        ... }
-        >>> result = execute_mock_exit(position, exit_price=0.45)
-        >>> if result['success']:
-        ...     print(f"Mock exit: Net profit ${result['net_profit']:.2f}")
     """
     global _mock_balance, _mock_positions, _mock_stats
     
@@ -3013,16 +3137,12 @@ def execute_mock_exit(position, exit_price):
     # Calculate P&L
     entry_price = trade_record['entry_price']
     shares = trade_record['shares']
-    side = trade_record['side']
     
-    # Gross profit (before fees)
-    if side == 'BUY':
-        gross_profit = (exit_price - entry_price) * shares
-    else:  # SELL
-        gross_profit = (entry_price - exit_price) * shares
+    # Simple P&L: (exit_price - entry_price) × shares
+    gross_profit = (exit_price - entry_price) * shares
     
-    # Fee is 10% of gross profit
-    fee = abs(gross_profit) * 0.10
+    # Fee is 10% of gross profit (only on profits, not losses)
+    fee = gross_profit * 0.10 if gross_profit > 0 else 0
     
     # Net profit (after fees)
     net_profit = gross_profit - fee
@@ -3053,18 +3173,19 @@ def execute_mock_exit(position, exit_price):
     # Remove from open positions
     del _mock_positions[asset_id]
     
-    # Log mock exit using new logging system
+    # Log mock exit
     profit_emoji = "✅" if net_profit > 0 else "❌"
     log_exit(f"{profit_emoji} Exit executed: ${net_profit:.2f} net profit")
     log_exit(f"  Position ID: {trade_record['id']}")
-    log_exit(f"  Exit price: ${exit_price:.3f}")
+    log_exit(f"  Entry: ${entry_price:.3f} -> Exit: ${exit_price:.3f}")
     log_exit(f"  Gross profit: ${gross_profit:.2f}")
     log_exit(f"  Fee (10%): ${fee:.2f}")
     log_exit(f"  Proceeds: ${proceeds:.2f}")
     log_exit(f"  Mock balance: ${_mock_balance:.2f}")
     
-    # Show stats every 10 trades
-    if _mock_stats['total_trades'] % 10 == 0:
+    # Show stats every 5 trades
+    total_closed = _mock_stats['wins'] + _mock_stats['losses']
+    if total_closed > 0 and total_closed % 5 == 0:
         show_mock_stats()
     
     return {
@@ -4055,6 +4176,7 @@ def make_trading_decision(market_info, momentum_data=None, rsi_data=None):
         'shares': shares,
         'market_id': market_id,
         'asset_id': asset_id,
+        'market_slug': market_info.get('slug'),  # Include slug for price updates
         'momentum': momentum_data,
         'rsi_signal': rsi_signal,
         'reasons': reasons
@@ -4364,6 +4486,7 @@ def execute_trade_with_monitoring(decision):
     position_size = decision['position_size']
     entry_price = decision['entry_price']
     target_profit = CONFIG['target_profit_per_trade']
+    market_slug = decision.get('market_slug')  # Get market slug for price updates
     
     # Execute the mock trade
     trade_result = execute_mock_trade(
@@ -4371,7 +4494,8 @@ def execute_trade_with_monitoring(decision):
         asset_id=asset_id,
         side=side,
         position_size=position_size,
-        entry_price=entry_price
+        entry_price=entry_price,
+        market_slug=market_slug
     )
     
     if not trade_result['success']:
@@ -4435,8 +4559,15 @@ def run_trading_iteration():
     3. Execute trade if conditions are met
     4. Start position monitoring
     
+    IMPORTANT: Even when entry conditions fail, the main loop continues
+    monitoring existing positions. This function only handles new trade
+    entry - position monitoring happens continuously in the main loop.
+    
     Returns:
         dict: Result of the trading iteration with status and details
+            - status: 'traded', 'skipped', 'failed', or 'error'
+            - reason: Human-readable explanation
+            - details: Additional context
     """
     print()
     print("="*60)
@@ -4450,7 +4581,8 @@ def run_trading_iteration():
         if not market_info:
             return {
                 'status': 'skipped',
-                'reason': 'Market not found or not active'
+                'reason': 'Market not found or not active',
+                'continue_monitoring': True  # Still monitor existing positions
             }
         
         # Step 2: Make trading decision (includes all entry checks)
@@ -4460,7 +4592,8 @@ def run_trading_iteration():
             return {
                 'status': 'skipped',
                 'reason': decision.get('reason', 'Entry conditions not met'),
-                'details': decision.get('details', {})
+                'details': decision.get('details', {}),
+                'continue_monitoring': True  # Still monitor existing positions
             }
         
         # Step 3: Execute trade with monitoring
@@ -4474,24 +4607,28 @@ def run_trading_iteration():
                     'asset_id': result.get('asset_id'),
                     'shares': result.get('shares'),
                     'entry_price': result.get('entry_price'),
-                    'monitoring': result.get('monitoring_started', False)
+                    'monitoring': result.get('monitoring_started', False),
+                    'continue_monitoring': True
                 }
             else:
                 return {
                     'status': 'failed',
-                    'reason': result.get('error', 'Trade execution failed')
+                    'reason': result.get('error', 'Trade execution failed'),
+                    'continue_monitoring': True  # Still monitor existing positions
                 }
         
         return {
             'status': 'skipped',
-            'reason': 'Unknown decision action'
+            'reason': 'Unknown decision action',
+            'continue_monitoring': True
         }
         
     except Exception as e:
         print(f"❌ Error in trading iteration: {e}")
         return {
             'status': 'error',
-            'reason': str(e)
+            'reason': str(e),
+            'continue_monitoring': True  # Still monitor existing positions even on error
         }
 
 
@@ -4507,6 +4644,9 @@ def log_position_status():
     - Current price vs entry price
     - Unrealized P&L
     - Progress toward target profit
+    
+    Note: Prices are updated separately by update_mock_position_prices()
+    which runs every 5 seconds in the main loop.
     """
     global _mock_positions
     
@@ -4519,42 +4659,45 @@ def log_position_status():
     log_position("-"*50, force=True)
     
     total_unrealized_pnl = 0
+    target_profit = CONFIG.get('target_profit_per_trade', 15.0)
     
-    for asset_id, position in _mock_positions.items():
+    for asset_id, position in list(_mock_positions.items()):
         side = position.get('side', 'N/A')
         shares = position.get('shares', 0)
         entry_price = position.get('entry_price', 0)
-        target_profit = CONFIG.get('target_profit_per_trade', 15.0)
+        current_price = position.get('current_price')
+        net_profit = position.get('net_profit', 0)
         
-        # Try to get current P&L from monitor
-        monitor = get_polymarket_monitor()
-        if monitor:
-            status = monitor.get_position_status(asset_id)
-            if status:
-                current_price = status.get('current_price')
-                net_profit = status.get('net_profit', 0)
-                
-                # Handle None values
-                if current_price is None:
-                    current_price = entry_price
-                if net_profit is None:
-                    net_profit = 0
-                
-                total_unrealized_pnl += net_profit
-                
-                # Calculate progress toward target
-                progress_pct = (net_profit / target_profit * 100) if target_profit > 0 else 0
-                progress_bar = "█" * int(progress_pct / 10) + "░" * (10 - int(progress_pct / 10))
-                
-                # Emoji based on P&L
-                pnl_emoji = "🟢" if net_profit > 0 else "🔴" if net_profit < 0 else "⚪"
-                
-                log_position(f"  {pnl_emoji} {asset_id[:12]}... | {side} {shares:.0f} @ ${entry_price:.3f}", force=True)
-                log_position(f"     Current: ${current_price:.3f} | P&L: ${net_profit:.2f} | [{progress_bar}] {progress_pct:.0f}%", force=True)
-            else:
-                log_position(f"  ⏳ {asset_id[:12]}... | {side} {shares:.0f} @ ${entry_price:.3f} | Awaiting price...", force=True)
+        # Handle None values - indicate waiting for price data
+        if current_price is None:
+            log_position(f"  ⏳ {asset_id[:12]}... | {side} {shares:.0f} @ ${entry_price:.3f} | Waiting for price...", force=True)
+            continue
+        
+        if net_profit is None:
+            net_profit = 0
+        
+        total_unrealized_pnl += net_profit
+        
+        # Calculate progress toward target
+        progress_pct = (net_profit / target_profit * 100) if target_profit > 0 else 0
+        progress_pct = max(-100, min(100, progress_pct))  # Clamp to -100 to 100
+        
+        if progress_pct >= 0:
+            progress_bar = "█" * int(progress_pct / 10) + "░" * (10 - int(progress_pct / 10))
         else:
-            log_position(f"  ❓ {asset_id[:12]}... | {side} {shares:.0f} @ ${entry_price:.3f} | No monitor", force=True)
+            # Show negative progress
+            neg_bars = int(abs(progress_pct) / 10)
+            progress_bar = "▓" * neg_bars + "░" * (10 - neg_bars)
+        
+        # Emoji based on P&L
+        pnl_emoji = "🟢" if net_profit > 0 else "🔴" if net_profit < 0 else "⚪"
+        
+        # Price change indicator
+        price_change = current_price - entry_price
+        price_emoji = "📈" if price_change > 0 else "📉" if price_change < 0 else "➡️"
+        
+        log_position(f"  {pnl_emoji} {asset_id[:12]}... | {side} {shares:.0f} @ ${entry_price:.3f}", force=True)
+        log_position(f"     {price_emoji} Current: ${current_price:.3f} ({price_change:+.3f}) | P&L: ${net_profit:.2f} | [{progress_bar}] {progress_pct:.0f}%", force=True)
     
     log_position("-"*50, force=True)
     
@@ -4562,6 +4705,117 @@ def log_position_status():
     pnl_emoji = "📈" if total_unrealized_pnl > 0 else "📉" if total_unrealized_pnl < 0 else "➖"
     log_position(f"  {pnl_emoji} Total unrealized P&L: ${total_unrealized_pnl:.2f}", force=True)
     log_position("-"*50, force=True)
+
+
+def close_expired_positions():
+    """
+    Close positions from previous iterations that didn't exit.
+    
+    Since these are 5-minute markets, if a position from a previous iteration
+    didn't reach the profit target and exit, the market has resolved and
+    the position is considered a loss.
+    
+    This function:
+    1. Checks each open position's market slug timestamp
+    2. If the market's 5-minute window has passed, close the position as a loss
+    3. Calculate final P&L based on market resolution (win/lose based on outcome)
+    
+    For simplicity in mock trading, we assume:
+    - If position didn't exit profitably, it's a loss
+    - Loss = entry cost (worst case: price went to 0 or 1 depending on side)
+    """
+    global _mock_positions, _mock_balance, _mock_stats
+    
+    if not _mock_positions:
+        return
+    
+    current_time = time.time()
+    current_5min = round_to_5min(int(current_time))
+    
+    positions_to_close = []
+    
+    for asset_id, position in _mock_positions.items():
+        # Get the market slug to determine when the market ends
+        market_slug = position.get('market_slug', '')
+        
+        if not market_slug:
+            # No slug, check by entry time - if more than 5 minutes old, close it
+            entry_time = position.get('entry_time', 0)
+            if current_time - entry_time > 300:  # 5 minutes = 300 seconds
+                positions_to_close.append(asset_id)
+            continue
+        
+        # Extract timestamp from slug (format: btc-updown-5m-{timestamp})
+        try:
+            slug_parts = market_slug.split('-')
+            market_timestamp = int(slug_parts[-1])
+            
+            # Market ends 5 minutes after the timestamp
+            market_end_time = market_timestamp + 300
+            
+            # If current time is past market end, position is expired
+            if current_time > market_end_time:
+                positions_to_close.append(asset_id)
+        except (ValueError, IndexError):
+            # Can't parse slug, check by entry time
+            entry_time = position.get('entry_time', 0)
+            if current_time - entry_time > 300:
+                positions_to_close.append(asset_id)
+    
+    # Close expired positions as losses
+    for asset_id in positions_to_close:
+        position = _mock_positions.get(asset_id)
+        if not position:
+            continue
+        
+        entry_price = position.get('entry_price', 0)
+        shares = position.get('shares', 0)
+        side = position.get('side', 'BUY')
+        cost = position.get('cost', entry_price * shares)
+        
+        # For expired positions, assume worst case loss
+        # BUY position: price went to 0, lose entire cost
+        # SELL position: price went to 1, lose entire cost
+        # In reality, we'd check the actual resolution, but for mock we assume loss
+        
+        # Calculate loss (negative profit)
+        gross_profit = -cost  # Lost the entire position cost
+        fee = 0  # No fee on loss
+        net_profit = gross_profit
+        
+        # Update mock balance (we already deducted cost on entry, so no change needed)
+        # The cost was already deducted, and we get nothing back
+        
+        # Update stats
+        _mock_stats['losses'] += 1
+        _mock_stats['total_pnl'] += net_profit
+        
+        # Update trade record
+        position['exit_price'] = 0 if side == 'BUY' else 1
+        position['exit_time'] = current_time
+        position['gross_profit'] = gross_profit
+        position['fee'] = fee
+        position['net_profit'] = net_profit
+        position['status'] = 'expired'
+        position['exit_reason'] = 'market_resolved_loss'
+        
+        # Log the loss
+        log_exit(f"❌ Position expired (market resolved): {asset_id[:16]}...")
+        log_exit(f"   Side: {side}, Shares: {shares:.0f}, Entry: ${entry_price:.3f}")
+        log_exit(f"   Loss: ${abs(net_profit):.2f}")
+        log_exit(f"   Mock balance: ${_mock_balance:.2f}")
+        
+        # Remove from open positions
+        del _mock_positions[asset_id]
+        
+        # Remove from Polymarket monitor if exists
+        monitor = get_polymarket_monitor()
+        if monitor:
+            monitor.remove_position(asset_id)
+    
+    if positions_to_close:
+        log_exit(f"📊 Closed {len(positions_to_close)} expired position(s)")
+        show_mock_stats()
 
 
 def run_main_loop():
@@ -4631,51 +4885,79 @@ def run_main_loop():
             print(f"📈 Iteration #{iteration_count}")
             print(f"{'='*60}")
             
-            result = run_trading_iteration()
+            # Close any expired positions from previous iterations (losses)
+            close_expired_positions()
             
-            # Log result
-            status = result.get('status', 'unknown')
-            if status == 'traded':
-                print(f"\n✅ Trade executed successfully")
-                print(f"   Position ID: {result.get('position_id')}")
-                shares = result.get('shares') or 0
-                entry_price = result.get('entry_price') or 0
-                print(f"   Shares: {shares:.2f}")
-                print(f"   Entry: ${entry_price:.3f}")
-            elif status == 'skipped':
-                print(f"\n⏭️ Skipped: {result.get('reason', 'Unknown')}")
-            elif status == 'failed':
-                print(f"\n❌ Failed: {result.get('reason', 'Unknown')}")
-            elif status == 'error':
-                print(f"\n⚠️ Error: {result.get('reason', 'Unknown')}")
-            
-            # Log position status periodically
-            current_time = time.time()
-            if current_time - last_position_log >= position_log_interval:
-                log_position_status()
-                last_position_log = current_time
-            
-            # Calculate sleep time until next 5-minute interval
+            # Calculate time until next 5-minute interval
             sleep_seconds = calculate_sleep_until_next_5min()
             next_time = datetime.now(timezone.utc).timestamp() + sleep_seconds
             next_dt = datetime.fromtimestamp(next_time, tz=timezone.utc)
             
-            print()
-            print(f"💤 Sleeping {sleep_seconds:.0f} seconds until next iteration...")
-            print(f"   Next iteration at: {next_dt.strftime('%H:%M:%S UTC')}")
+            print(f"⏳ Continuous monitoring until {next_dt.strftime('%H:%M:%S UTC')} ({sleep_seconds:.0f}s)")
             
-            # Sleep in small intervals to allow for position status logging
-            sleep_start = time.time()
-            while time.time() - sleep_start < sleep_seconds:
-                # Check if we should log position status
-                if time.time() - last_position_log >= position_log_interval:
-                    log_position_status()
-                    last_position_log = time.time()
+            # Continuous trading check loop - keep checking entry conditions
+            loop_start = time.time()
+            last_trade_check = 0
+            last_price_update = 0
+            trade_check_interval = 5  # Check entry conditions every 5 seconds
+            price_update_interval = 5  # Update prices every 5 seconds
+            traded_this_iteration = False
+            
+            while time.time() - loop_start < sleep_seconds:
+                current_time = time.time()
                 
-                # Sleep for 1 second at a time
-                remaining = sleep_seconds - (time.time() - sleep_start)
+                # Check entry conditions periodically (every 5 seconds) if not already traded
+                if not traded_this_iteration and (current_time - last_trade_check >= trade_check_interval):
+                    last_trade_check = current_time
+                    elapsed = int(current_time - loop_start)
+                    
+                    print(f"\n🔍 Checking entry conditions ({elapsed}s elapsed)...")
+                    
+                    result = run_trading_iteration()
+                    status = result.get('status', 'unknown')
+                    
+                    if status == 'traded':
+                        print(f"\n✅ Trade executed successfully")
+                        print(f"   Position ID: {result.get('position_id')}")
+                        shares = result.get('shares') or 0
+                        entry_price = result.get('entry_price') or 0
+                        print(f"   Shares: {shares:.2f}")
+                        print(f"   Entry: ${entry_price:.3f}")
+                        traded_this_iteration = True  # Don't try to enter again this iteration
+                    elif status == 'skipped':
+                        print(f"   ⏭️ No entry: {result.get('reason', 'Unknown')}")
+                    elif status == 'failed':
+                        print(f"   ❌ Failed: {result.get('reason', 'Unknown')}")
+                    elif status == 'error':
+                        print(f"   ⚠️ Error: {result.get('reason', 'Unknown')}")
+                
+                # Update position prices continuously (every 5 seconds)
+                if len(_mock_positions) > 0 and (current_time - last_price_update >= price_update_interval):
+                    last_price_update = current_time
+                    # Update prices and check for exit conditions
+                    update_mock_position_prices()
+                
+                # Log position status periodically (every 30 seconds)
+                if current_time - last_position_log >= position_log_interval:
+                    if len(_mock_positions) > 0:
+                        elapsed = int(current_time - loop_start)
+                        print(f"\n📊 Position status ({elapsed}s elapsed):")
+                        log_position_status()
+                    last_position_log = current_time
+                
+                # Sleep for 1 second at a time to stay responsive
+                remaining = sleep_seconds - (time.time() - loop_start)
                 if remaining > 0:
                     time.sleep(min(1, remaining))
+            
+            # Summary at end of iteration
+            print(f"\n{'='*60}")
+            if traded_this_iteration:
+                print(f"✅ Iteration #{iteration_count} complete - Trade executed")
+            else:
+                print(f"⏭️ Iteration #{iteration_count} complete - No trade")
+            print(f"   Open positions: {len(_mock_positions)}")
+            print(f"{'='*60}")
             
         except Exception as e:
             print(f"\n❌ Error in main loop iteration: {e}")
