@@ -2233,16 +2233,13 @@ class PolymarketPositionMonitor:
     
     def remove_position(self, asset_id):
         """
-        Remove a position from monitoring.
+        Remove a position from monitoring and unsubscribe from WebSocket.
         
-        Stops monitoring a position and removes it from tracking.
-        Does not unsubscribe from the asset (other positions may use it).
+        Stops monitoring a position, removes it from tracking, and
+        unsubscribes from the WebSocket to stop receiving price updates.
         
         Args:
             asset_id: Token ID to stop monitoring
-        
-        Example:
-            >>> monitor.remove_position("71321...")
         """
         # Remove position
         if asset_id in self.positions:
@@ -2253,8 +2250,20 @@ class PolymarketPositionMonitor:
         if asset_id in self.callbacks:
             del self.callbacks[asset_id]
         
-        # Note: We don't unsubscribe from the asset because other positions
-        # might be using it, or we might want to keep monitoring prices
+        # Unsubscribe from WebSocket
+        if asset_id in self.subscribed_assets:
+            self.subscribed_assets.remove(asset_id)
+            
+            # Send unsubscribe message if connected
+            if self.running and self.ws:
+                try:
+                    unsubscribe_msg = {
+                        "type": "unsubscribe",
+                        "assets_ids": [asset_id]
+                    }
+                    self.ws.send(json.dumps(unsubscribe_msg))
+                except Exception as e:
+                    log_error(f"Error unsubscribing from asset: {e}")
     
     def get_position_status(self, asset_id):
         """
