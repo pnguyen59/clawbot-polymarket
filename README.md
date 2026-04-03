@@ -1,1 +1,0 @@
-# clawbot-polymarket
