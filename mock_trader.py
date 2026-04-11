@@ -33,6 +33,13 @@ import requests
 
 
 # ============================================================================
+# API Constants
+# ============================================================================
+
+CLOB_HOST = "https://clob.polymarket.com"
+
+
+# ============================================================================
 # Retry Utility with Exponential Backoff
 # ============================================================================
 
@@ -1770,8 +1777,7 @@ class PolymarketPositionMonitor:
         Handle incoming WebSocket messages.
         
         Processes different message types:
-        - book: Full orderbook snapshot
-        - price_change: Price level updates with best_bid/best_ask
+        - price_change: Price level updates with side (BUY/SELL) and price
         - market_resolved: Market resolution notification
         
         Args:
@@ -1791,35 +1797,19 @@ class PolymarketPositionMonitor:
             data = json.loads(message)
             event_type = data.get('event_type')
             
-            if event_type == 'book':
-                # Full orderbook snapshot
-                asset_id = data.get('asset_id')
-                
-                # Extract best bid and ask from orderbook
-                bids = data.get('bids', [])
-                asks = data.get('asks', [])
-                
-                best_bid = float(bids[0]['price']) if bids else None
-                best_ask = float(asks[0]['price']) if asks else None
-                
-                self._process_price_update(asset_id, best_bid, best_ask)
-                
-            elif event_type == 'price_change':
+            if event_type == 'price_change':
                 # Price level updates
                 price_changes = data.get('price_changes', [])
                 
                 for change in price_changes:
                     asset_id = change.get('asset_id')
-                    best_bid = change.get('best_bid')
-                    best_ask = change.get('best_ask')
+                    side = change.get('side')  # 'BUY' or 'SELL'
+                    price = change.get('price')
                     
-                    # Convert to float if present
-                    if best_bid is not None:
-                        best_bid = float(best_bid)
-                    if best_ask is not None:
-                        best_ask = float(best_ask)
+                    if price is not None:
+                        price = float(price)
                     
-                    self._process_price_update(asset_id, best_bid, best_ask)
+                    self._process_price_update(asset_id, side, price)
             
             elif event_type == 'market_resolved':
                 # Market resolved - close all positions for this market
@@ -1838,19 +1828,18 @@ class PolymarketPositionMonitor:
         except Exception as e:
             log_websocket(f"Polymarket unexpected error in _on_message: {e}")
     
-    def _process_price_update(self, asset_id, best_bid, best_ask):
+    def _process_price_update(self, asset_id, side, price):
         """
         Process price update and check exit conditions.
         
-        For mock trading, we use the market price directly (not bid/ask).
-        The price from the API represents the current market price.
-        
-        P&L = (current_price - entry_price) × shares
+        Only updates price if the side matches the position's side.
+        - If position side is 'BUY' (YES token), use BUY side price
+        - If position side is 'SELL' (NO token), use SELL side price
         
         Args:
             asset_id: Token ID (asset_id)
-            best_bid: Best bid price (used as current price indicator)
-            best_ask: Best ask price (alternative price indicator)
+            side: Price side ('BUY' or 'SELL')
+            price: Current price for that side
         """
         global _mock_positions
         
@@ -1864,12 +1853,15 @@ class PolymarketPositionMonitor:
         if position.get('exit_triggered', False):
             return
         
-        # Use best_bid as current price (or best_ask if bid not available)
-        # In mock trading, we assume we can trade at this price
-        current_price = best_bid if best_bid is not None else best_ask
-        
-        if current_price is None:
+        # Only update if side matches position side
+        position_side = position.get('side', 'BUY')
+        if side != position_side:
             return
+        
+        if price is None:
+            return
+        
+        current_price = price
         
         # Calculate current P&L
         entry_price = position['entry_price']
@@ -2713,6 +2705,35 @@ def fetch_market_by_slug(slug):
         return None
     except Exception as e:
         print(f"[Gamma API] Unexpected error: {e}")
+        return None
+
+
+def fetch_market_price(token_id, side):
+    """
+    Fetch market price from Polymarket CLOB API /price endpoint.
+    
+    Args:
+        token_id: Token ID (asset_id)
+        side: 'BUY' or 'SELL'
+    
+    Returns:
+        Market price or None on error
+    """
+    url = f"{CLOB_HOST}/price"
+    params = {'token_id': token_id, 'side': side}
+    
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        price = data.get('price')
+        if price is not None:
+            return float(price)
+        return None
+        
+    except Exception as e:
+        log_error(f"Market price fetch error: {e}")
         return None
 
 
@@ -4094,7 +4115,7 @@ def make_trading_decision(market_info, momentum_data=None, rsi_data=None):
         if not yes_token:
             yes_token = tokens[0]  # Fallback to first token
         asset_id = yes_token['asset_id']
-        entry_price = yes_token['price']
+        fallback_price = yes_token['price']
     else:
         side = 'SELL'
         # Find NO token
@@ -4102,7 +4123,18 @@ def make_trading_decision(market_info, momentum_data=None, rsi_data=None):
         if not no_token:
             no_token = tokens[1] if len(tokens) > 1 else tokens[0]
         asset_id = no_token['asset_id']
-        entry_price = no_token['price']
+        fallback_price = no_token['price']
+    
+    # Fetch REAL market price from CLOB API /price endpoint
+    print("\n📖 Fetching market price...")
+    entry_price = fetch_market_price(asset_id, 'BUY')
+    
+    if entry_price:
+        print(f"   Market price (BUY): ${entry_price:.3f}")
+    else:
+        # Fallback to Gamma API price (less accurate)
+        entry_price = fallback_price
+        print(f"   ⚠️ Using Gamma API price (may be stale): ${entry_price:.3f}")
     
     # -------------------------------------------------------------------------
     # Check 4: Profit Requirement
@@ -4720,18 +4752,8 @@ def close_expired_positions():
     """
     Close positions from previous iterations that didn't exit.
     
-    Since these are 5-minute markets, if a position from a previous iteration
-    didn't reach the profit target and exit, the market has resolved and
-    the position is considered a loss.
-    
-    This function:
-    1. Checks each open position's market slug timestamp
-    2. If the market's 5-minute window has passed, close the position as a loss
-    3. Calculate final P&L based on market resolution (win/lose based on outcome)
-    
-    For simplicity in mock trading, we assume:
-    - If position didn't exit profitably, it's a loss
-    - Loss = entry cost (worst case: price went to 0 or 1 depending on side)
+    Simple rule: If position didn't exit within 5 minutes, it's a loss.
+    The bet didn't hit the target, so we lost the cost.
     """
     global _mock_positions, _mock_balance, _mock_stats
     
@@ -4739,34 +4761,26 @@ def close_expired_positions():
         return
     
     current_time = time.time()
-    current_5min = round_to_5min(int(current_time))
     
     positions_to_close = []
     
     for asset_id, position in _mock_positions.items():
-        # Get the market slug to determine when the market ends
         market_slug = position.get('market_slug', '')
         
         if not market_slug:
-            # No slug, check by entry time - if more than 5 minutes old, close it
             entry_time = position.get('entry_time', 0)
-            if current_time - entry_time > 300:  # 5 minutes = 300 seconds
+            if current_time - entry_time > 300:
                 positions_to_close.append(asset_id)
             continue
         
-        # Extract timestamp from slug (format: btc-updown-5m-{timestamp})
         try:
             slug_parts = market_slug.split('-')
             market_timestamp = int(slug_parts[-1])
-            
-            # Market ends 5 minutes after the timestamp
             market_end_time = market_timestamp + 300
             
-            # If current time is past market end, position is expired
             if current_time > market_end_time:
                 positions_to_close.append(asset_id)
         except (ValueError, IndexError):
-            # Can't parse slug, check by entry time
             entry_time = position.get('entry_time', 0)
             if current_time - entry_time > 300:
                 positions_to_close.append(asset_id)
@@ -4782,42 +4796,27 @@ def close_expired_positions():
         side = position.get('side', 'BUY')
         cost = position.get('cost', entry_price * shares)
         
-        # For expired positions, assume worst case loss
-        # BUY position: price went to 0, lose entire cost
-        # SELL position: price went to 1, lose entire cost
-        # In reality, we'd check the actual resolution, but for mock we assume loss
+        # No exit = loss
+        net_profit = -cost
         
-        # Calculate loss (negative profit)
-        gross_profit = -cost  # Lost the entire position cost
-        fee = 0  # No fee on loss
-        net_profit = gross_profit
-        
-        # Update mock balance (we already deducted cost on entry, so no change needed)
-        # The cost was already deducted, and we get nothing back
-        
-        # Update stats
         _mock_stats['losses'] += 1
         _mock_stats['total_pnl'] += net_profit
         
-        # Update trade record
-        position['exit_price'] = 0 if side == 'BUY' else 1
+        position['exit_price'] = 0
         position['exit_time'] = current_time
-        position['gross_profit'] = gross_profit
-        position['fee'] = fee
+        position['gross_profit'] = -cost
+        position['fee'] = 0
         position['net_profit'] = net_profit
         position['status'] = 'expired'
-        position['exit_reason'] = 'market_resolved_loss'
+        position['exit_reason'] = 'no_exit_loss'
         
-        # Log the loss
-        log_exit(f"❌ Position expired (market resolved): {asset_id[:16]}...")
-        log_exit(f"   Side: {side}, Shares: {shares:.0f}, Entry: ${entry_price:.3f}")
+        log_exit(f"❌ Position expired (no exit = loss): {asset_id[:16]}...")
+        log_exit(f"   Side: {side}, Shares: {shares:.2f}, Entry: ${entry_price:.3f}")
         log_exit(f"   Loss: ${abs(net_profit):.2f}")
         log_exit(f"   Mock balance: ${_mock_balance:.2f}")
         
-        # Remove from open positions
         del _mock_positions[asset_id]
         
-        # Remove from Polymarket monitor if exists
         monitor = get_polymarket_monitor()
         if monitor:
             monitor.remove_position(asset_id)

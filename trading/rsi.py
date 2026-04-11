@@ -49,32 +49,95 @@ def calculate_rsi(prices: List[float], period: int = 7) -> Optional[float]:
     return rsi
 
 
-def get_rsi_signal(rsi_values: List[float]) -> Optional[str]:
+def classify_signal(rsi_current: float, rsi_prev: float, rsi_prev2: float) -> str:
     """
-    Get RSI signal based on 3 consecutive rising or falling RSI values.
+    Classify RSI signal based on momentum (2 consecutive periods).
     
     Args:
-        rsi_values: List of RSI values (need at least 3)
+        rsi_current: Current RSI value
+        rsi_prev: Previous RSI value (1 bar ago)
+        rsi_prev2: RSI value 2 bars ago
     
     Returns:
-        'BUY' if 3 consecutive rising, 'SELL' if 3 consecutive falling, None otherwise
+        Classification: 'green', 'red', or 'neutral'
     """
-    if len(rsi_values) < 3:
+    # Green: RSI increasing for 2 consecutive periods
+    if rsi_current > rsi_prev and rsi_prev > rsi_prev2:
+        return 'green'
+    
+    # Red: RSI decreasing for 2 consecutive periods
+    if rsi_current < rsi_prev and rsi_prev < rsi_prev2:
+        return 'red'
+    
+    # Neutral: mixed signals
+    return 'neutral'
+
+
+class RSISignalMemory:
+    """Memory for RSI signals to detect patterns."""
+    
+    def __init__(self, max_size: int = 10):
+        self._memory = deque(maxlen=max_size)
+    
+    def add(self, rsi_value: float, classification: str):
+        """Add a signal to memory."""
+        self._memory.append({
+            'rsi': rsi_value,
+            'classification': classification,
+            'timestamp': time.time()
+        })
+    
+    def get_entry_signal(self, current_rsi_values: List[float]) -> Optional[str]:
+        """
+        Check for entry signal based on memory and current RSI values.
+        
+        Requires 3 consecutive green signals for BUY, 3 consecutive red for SELL.
+        
+        Args:
+            current_rsi_values: List of recent RSI values (need at least 3)
+        
+        Returns:
+            'BUY', 'SELL', or None
+        """
+        # Need at least 2 signals in memory
+        if len(self._memory) < 2:
+            return None
+        
+        # Need at least 3 RSI values to calculate current signal
+        if len(current_rsi_values) < 3:
+            return None
+        
+        # Get last 2 signals from memory
+        signal_1 = self._memory[-2]  # 2nd most recent
+        signal_2 = self._memory[-1]  # Most recent
+        
+        # Calculate current signal from fresh RSI data
+        rsi_2_bars_ago = current_rsi_values[-3]
+        rsi_1_bar_ago = current_rsi_values[-2]
+        rsi_current = current_rsi_values[-1]
+        
+        current_signal = classify_signal(rsi_current, rsi_1_bar_ago, rsi_2_bars_ago)
+        
+        # BUY: 3 consecutive green signals
+        if (signal_1['classification'] == 'green' and 
+            signal_2['classification'] == 'green' and 
+            current_signal == 'green'):
+            return 'BUY'
+        
+        # SELL: 3 consecutive red signals
+        if (signal_1['classification'] == 'red' and 
+            signal_2['classification'] == 'red' and 
+            current_signal == 'red'):
+            return 'SELL'
+        
         return None
     
-    rsi_3 = rsi_values[-3]  # 2 bars ago
-    rsi_2 = rsi_values[-2]  # 1 bar ago
-    rsi_1 = rsi_values[-1]  # current
+    def clear(self):
+        """Clear the memory."""
+        self._memory.clear()
     
-    # BUY: 3 consecutive rising RSI
-    if rsi_1 > rsi_2 > rsi_3:
-        return 'BUY'
-    
-    # SELL: 3 consecutive falling RSI
-    if rsi_1 < rsi_2 < rsi_3:
-        return 'SELL'
-    
-    return None
+    def __len__(self):
+        return len(self._memory)
 
 
 class BinanceRSIStream:
@@ -223,14 +286,16 @@ class BinanceRSIStream:
         
         rsi_list = list(self.rsi_values)
         rsi_current = rsi_list[-1]
+        rsi_prev = rsi_list[-2]
+        rsi_prev2 = rsi_list[-3]
         
-        # Get signal using simplified 3 consecutive logic
-        signal = get_rsi_signal(rsi_list)
+        # Classify using 3 RSI values
+        classification = classify_signal(rsi_current, rsi_prev, rsi_prev2)
         
         return {
             'current_rsi': rsi_current,
             'rsi_values': rsi_list,
-            'signal': signal  # 'BUY', 'SELL', or None
+            'classification': classification
         }
     
     def is_connected(self) -> bool:

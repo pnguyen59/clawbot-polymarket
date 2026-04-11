@@ -6,7 +6,11 @@ from typing import Optional, Dict
 
 from .config import CONFIG, BUY, SELL
 from .market import check_momentum, fetch_market_price
-from .rsi import get_rsi_signal
+from .rsi import RSISignalMemory, classify_signal
+
+
+# Global signal memory
+_signal_memory = RSISignalMemory(max_size=CONFIG['rsi_signal_memory_size'])
 
 
 def calculate_position_size(entry_price: float, target_profit: float = None, 
@@ -149,29 +153,39 @@ def make_trading_decision(market_info: Dict, momentum_data: Dict = None,
     if CONFIG['rsi_enabled']:
         if rsi_data:
             rsi_values = rsi_data.get('rsi_values', [])
-            current_rsi = rsi_data.get('current_rsi')
             
-            # Get RSI signal (3 consecutive rising = BUY, 3 consecutive falling = SELL)
-            rsi_signal = get_rsi_signal(rsi_values)
-            
-            print(f"   RSI: {current_rsi:.1f}")
-            print(f"   Signal: {rsi_signal or 'NEUTRAL'}")
-            
-            if CONFIG['rsi_require_confirmation']:
-                # RSI must have a clear signal (not neutral)
-                if rsi_signal is None:
-                    print("   ❌ RSI signal is NEUTRAL - skipping")
-                    return {'action': 'SKIP', 'reason': 'RSI signal is neutral'}
+            # Calculate current classification from fresh RSI data
+            if len(rsi_values) >= 3:
+                current_classification = classify_signal(
+                    rsi_values[-1], rsi_values[-2], rsi_values[-3]
+                )
+                _signal_memory.add(rsi_data['current_rsi'], current_classification)
                 
-                # RSI must confirm momentum direction
-                if direction == 'up' and rsi_signal == 'SELL':
-                    print("   ❌ RSI SELL conflicts with UP momentum")
-                    return {'action': 'SKIP', 'reason': 'RSI conflicts with momentum'}
-                if direction == 'down' and rsi_signal == 'BUY':
-                    print("   ❌ RSI BUY conflicts with DOWN momentum")
-                    return {'action': 'SKIP', 'reason': 'RSI conflicts with momentum'}
+                # Get entry signal (requires 3 consecutive green/red)
+                rsi_signal = _signal_memory.get_entry_signal(rsi_values)
                 
-                print("   ✅ RSI confirms momentum")
+                print(f"   RSI: {rsi_data['current_rsi']:.1f} ({current_classification})")
+                print(f"   Signal: {rsi_signal or 'NEUTRAL'}")
+                
+                if CONFIG['rsi_require_confirmation']:
+                    # RSI must have a clear signal (not neutral)
+                    if rsi_signal is None:
+                        print("   ❌ RSI signal is NEUTRAL - skipping")
+                        return {'action': 'SKIP', 'reason': 'RSI signal is neutral'}
+                    
+                    # RSI must confirm momentum direction
+                    if direction == 'up' and rsi_signal == 'SELL':
+                        print("   ❌ RSI SELL conflicts with UP momentum")
+                        return {'action': 'SKIP', 'reason': 'RSI conflicts with momentum'}
+                    if direction == 'down' and rsi_signal == 'BUY':
+                        print("   ❌ RSI BUY conflicts with DOWN momentum")
+                        return {'action': 'SKIP', 'reason': 'RSI conflicts with momentum'}
+                    
+                    print("   ✅ RSI confirms momentum")
+            else:
+                print("   ⚠️ Insufficient RSI data")
+                if CONFIG['rsi_require_confirmation']:
+                    return {'action': 'SKIP', 'reason': 'Insufficient RSI data'}
         else:
             print("   ⚠️ RSI data unavailable")
             if CONFIG['rsi_require_confirmation']:
